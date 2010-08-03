@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 use base 'Exporter';
 
@@ -41,16 +41,16 @@ if ($Profiling || $UseValgrind) {
     $ForkManager = new Parallel::ForkManager($MAX_PROCESSES);
 }
 
+our $NginxBinary            = $ENV{TEST_NGINX_BINARY} || 'nginx';
 our $Workers                = 1;
 our $WorkerConnections      = 64;
 our $LogLevel               = 'debug';
 our $MasterProcessEnabled   = 'off';
 our $DaemonEnabled          = 'on';
-our $ServerPort             = 1984;
-our $ServerPortForClient    = $ENV{TEST_NGINX_CLIENT_PORT} || 1984;
-our $NoRootLocation = 0;
-#our $ServerPortForClient    = 1984;
-
+our $ServerPort             = $ENV{TEST_NGINX_PORT} || $ENV{TEST_NGINX_SERVER_PORT} || 1984;
+our $ServerPortForClient    = $ENV{TEST_NGINX_PORT} || $ENV{TEST_NGINX_CLIENT_PORT} || 1984;
+our $NoRootLocation         = 0;
+our $TestNginxSleep         = $ENV{TEST_NGINX_SLEEP} || 0;
 
 sub repeat_each (@) {
     if (@_) {
@@ -128,6 +128,8 @@ our @EXPORT_OK = qw(
     log_level
     no_shuffle
     no_root_location
+    html_dir
+    server_root
 );
 
 
@@ -150,7 +152,7 @@ our $TODO;
 
 #our ($PrevRequest, $PrevConfig);
 
-our $ServRoot   = File::Spec->catfile(cwd(), 't/servroot');
+our $ServRoot   = $ENV{TEST_NGINX_ROOT} || File::Spec->catfile(cwd(), 't/servroot');
 our $LogDir     = File::Spec->catfile($ServRoot, 'logs');
 our $ErrLogFile = File::Spec->catfile($LogDir, 'error.log');
 our $AccLogFile = File::Spec->catfile($LogDir, 'access.log');
@@ -158,6 +160,14 @@ our $HtmlDir    = File::Spec->catfile($ServRoot, 'html');
 our $ConfDir    = File::Spec->catfile($ServRoot, 'conf');
 our $ConfFile   = File::Spec->catfile($ConfDir, 'nginx.conf');
 our $PidFile    = File::Spec->catfile($LogDir, 'nginx.pid');
+
+sub html_dir () {
+    return $HtmlDir;
+}
+
+sub server_root () {
+    return $ServRoot;
+}
 
 sub run_tests () {
     $NginxVersion = get_nginx_version();
@@ -179,11 +189,16 @@ sub run_tests () {
 
 sub setup_server_root () {
     if (-d $ServRoot) {
-        #sleep 0.5;
-        #die ".pid file $PidFile exists.\n";
-        system("rm -rf t/servroot > /dev/null") == 0 or
-            die "Can't remove t/servroot";
-        #sleep 0.5;
+        # Take special care, so we won't accidentally remove
+        # real user data when TEST_NGINX_ROOT is mis-used.
+        system("rm -rf $ConfDir > /dev/null") == 0 or
+            die "Can't remove $ConfDir";
+        system("rm -rf $HtmlDir > /dev/null") == 0 or
+            die "Can't remove $HtmlDir";
+        system("rm -rf $LogDir > /dev/null") == 0 or
+            die "Can't remove $LogDir";
+        system("rmdir $ServRoot > /dev/null") == 0 or
+            die "Can't remove $ServRoot (not empty?)";
     }
     mkdir $ServRoot or
         die "Failed to do mkdir $ServRoot\n";
@@ -321,11 +336,11 @@ sub get_canon_version (@) {
 }
 
 sub get_nginx_version () {
-    my $out = `nginx -V 2>&1`;
+    my $out = `$NginxBinary -V 2>&1`;
     if (!defined $out || $? != 0) {
         warn "Failed to get the version of the Nginx in PATH.\n";
     }
-    if ($out =~ m{nginx/(\d+)\.(\d+)\.(\d+)}s) {
+    if ($out =~ m{(?:nginx|ngx_openresty)/(\d+)\.(\d+)\.(\d+)}s) {
         $NginxRawVersion = "$1.$2.$3";
         return get_canon_version($1, $2, $3);
     }
@@ -389,6 +404,7 @@ sub run_test ($) {
     }
 
     my $skip_nginx = $block->skip_nginx;
+    my $skip_nginx2 = $block->skip_nginx2;
     my ($tests_to_skip, $should_skip, $skip_reason);
     if (defined $skip_nginx) {
         if ($skip_nginx =~ m{
@@ -411,7 +427,37 @@ sub run_test ($) {
                 $skip_nginx);
             die;
         }
+    } elsif (defined $skip_nginx2) {
+        if ($skip_nginx2 =~ m{
+                ^ \s* (\d+) \s* : \s*
+                    ([<>]=?) \s* (\d+)\.(\d+)\.(\d+)
+                    \s* (or|and) \s*
+                    ([<>]=?) \s* (\d+)\.(\d+)\.(\d+)
+                    (?: \s* : \s* (.*) )?
+                \s*$}x) {
+            $tests_to_skip = $1;
+            my ($opa, $ver1a, $ver2a, $ver3a) = ($2, $3, $4, $5);
+            my $opx = $6;
+            my ($opb, $ver1b, $ver2b, $ver3b) = ($7, $8, $9, $10);
+            $skip_reason = $11;
+            my $vera = get_canon_version($ver1a, $ver2a, $ver3a);
+            my $verb = get_canon_version($ver1b, $ver2b, $ver3b);
+
+            if ((!defined $NginxVersion)
+                or (($opx eq "or") and (eval "$NginxVersion $opa $vera"
+                                        or eval "$NginxVersion $opb $verb"))
+                or (($opx eq "and") and (eval "$NginxVersion $opa $vera"
+                                        and eval "$NginxVersion $opb $verb")))
+            {
+                $should_skip = 1;
+            }
+        } else {
+            Test::More::BAIL_OUT("$name - Invalid --- skip_nginx2 spec: " .
+                $skip_nginx2);
+            die;
+        }
     }
+
     if (!defined $skip_reason) {
         $skip_reason = "various reasons";
     }
@@ -483,7 +529,7 @@ start_nginx:
             setup_server_root();
             write_user_files($block);
             write_config_file($config, $block->http_config);
-            if ( ! Module::Install::Can->can_run('nginx') ) {
+            if ( ! Module::Install::Can->can_run($NginxBinary) ) {
                 Test::More::BAIL_OUT("$name - Cannot find the nginx executable in the PATH environment");
                 die;
             }
@@ -497,9 +543,9 @@ start_nginx:
 
             my $cmd;
             if ($NginxVersion >= 0.007053) {
-                $cmd = "nginx -p $ServRoot/ -c $ConfFile > /dev/null";
+                $cmd = "$NginxBinary -p $ServRoot/ -c $ConfFile > /dev/null";
             } else {
-                $cmd = "nginx -c $ConfFile > /dev/null";
+                $cmd = "$NginxBinary -c $ConfFile > /dev/null";
             }
 
             if ($UseValgrind) {
@@ -533,7 +579,11 @@ start_nginx:
 
                 }
                 #warn "sleeping";
-                sleep 1;
+                if ($TestNginxSleep) {
+                    sleep $TestNginxSleep;
+                } else {
+                    sleep 1;
+                }
             } else {
                 if (system($cmd) != 0) {
                     Test::More::BAIL_OUT("$name - Cannot start nginx using command \"$cmd\".");
@@ -580,7 +630,11 @@ start_nginx:
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
-                sleep 0.1;
+                if ($TestNginxSleep) {
+                    sleep $TestNginxSleep;
+                } else {
+                    sleep 0.1;
+                }
                 if (-f $PidFile) {
                     #warn "killing with force (valgrind or profile)...\n";
                     kill(SIGKILL, $pid);
@@ -606,7 +660,11 @@ END {
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
-                sleep 0.02;
+                if ($TestNginxSleep) {
+                    sleep $TestNginxSleep;
+                } else {
+                    sleep 0.02;
+                }
                 if (system("ps $pid > /dev/null") == 0) {
                     #warn "killing with force...\n";
                     kill(SIGKILL, $pid);
